@@ -1,0 +1,158 @@
+#+TITLE: Transcribing a meeting with gufo
+#+OPTIONS: toc:nil
+
+Two tracks, one local model:
+
+#+CAPTION: mic and loudspeaker, kept apart end to end
+#+BEGIN_EXAMPLE
+  microphone ─► parec (mono s16le 24k) ─► fifo ─┐
+                                                ├─► asr_meeting.py ─ws─► gufo serve asr
+  speaker    ─► parec <sink>.monitor   ─► fifo ─┘        │                    :8081
+                                                         │
+                                     meeting-<ts>.md / .jsonl / *.wav
+#+END_EXAMPLE
+
+=asr_meeting.py= keeps the two sides apart (MIC / PEER), finds the utterance
+boundaries itself — gufo does no endpointing for Qwen3-ASR — and commits each
+utterance to =/v1/realtime?intent=transcription=. Gufo transcribes at ~15x real
+time, so one 1.7B model carries both tracks of a call with room to spare.
+
+* 1. Model and server
+
+One process serves one model, so the ASR server is a second gufo beside your LLM
+on :8080. They share unified memory.
+
+#+BEGIN_SRC sh
+hf download Qwen/Qwen3-ASR-1.7B \
+  --revision 7278e1e70fe206f11671096ffdd38061171dd6e5 \
+  --local-dir models/Qwen3-ASR-1.7B
+
+gufo serve asr --model models/Qwen3-ASR-1.7B --port 8081
+curl -s http://127.0.0.1:8081/ready        # 200 when it will take requests
+#+END_SRC
+
+With the podman wrapper from the quickstart, add =-v ./models:/models:ro= and
+=--port 8081=; =--network host= already publishes it on localhost.
+=gufo-asr.service= is a unit for it.
+
+Sanity check without touching audio hardware:
+
+#+BEGIN_SRC sh
+curl -sS http://127.0.0.1:8081/v1/audio/transcriptions \
+  -F file=@speech.wav -F model=qwen3-asr-1.7b -F response_format=json
+#+END_SRC
+
+* 2. Client dependencies
+
+#+BEGIN_SRC sh
+pip install numpy websockets
+#+END_SRC
+
+* 3. Look at the devices
+
+#+BEGIN_SRC sh
+./meeting.sh devices
+#+END_SRC
+
+Lists sinks, sources (every sink has a =<sink>.monitor=) and live playback
+streams. By default the script records the default source and the monitor of the
+default sink.
+
+* 4. Record
+
+#+BEGIN_SRC sh
+./meeting.sh                                   # mic + whatever the laptop plays
+./meeting.sh --mic alsa_input.usb-… --peer alsa_output.pci-…-analog-stereo
+./meeting.sh --lang it                         # skip language guessing
+./meeting.sh --dry-run                         # segment only, model untouched
+#+END_SRC
+
+Lines appear on the terminal as they are ready, in these files:
+
+| file                          | contents                                                |
+|-------------------------------+---------------------------------------------------------+
+| =meeting-<ts>.md=             | =- **14:03:11 PEER** (3.2s) text= — readable minutes   |
+| =meeting-<ts>.jsonl=          | one utterance per record: time, track, duration, asr_ms |
+| =meeting-<ts>.events.jsonl=   | raw server events, for debugging                        |
+| =meeting-<ts>.{mic,peer}.wav= | what the model heard (=--no-record= to skip)            |
+
+Ctrl-C closes the last utterance, flushes and exits.
+
+To try the pipeline with no server and no audio hardware:
+
+#+BEGIN_SRC sh
+python3 mock_asr_server.py 8099 &            # speaks the same WebSocket protocol
+pw-record --rate 24000 --channels 1 --format s16 -a - \
+  | ./asr_meeting.py --source - --sample-width 2 --layout MIC
+# or replay anything: ./asr_meeting.py --source test.wav --layout MIC,PEER
+#+END_SRC
+
+* 5. Only the meeting, not Spotify
+
+=--isolate= creates an =asr_call= null sink, loops it back to your real output so
+you still hear people, and points PEER at it:
+
+#+BEGIN_SRC sh
+./meeting.sh --isolate
+#+END_SRC
+
+Move the call into it (=pactl list short sink-inputs=, then =pactl
+move-sink-input <id> asr_call=), or make it the default while the meeting runs
+(=pactl set-default-sink asr_call=). For something permanent, write a
+=libpipewire-module-loopback= drop-in under
+=~/.config/pipewire/pipewire.conf.d/= instead of the runtime =pactl= calls.
+
+Speakers in the room are the other echo: the mic hears the far end, so their
+sentences land twice. Headphones are the honest fix; the software version is
+=libpipewire-module-echo-cancel= (or =pactl load-module module-echo-cancel
+source_name=ec_mic sink_name=ec_out source_master=… sink_master=…=). The two
+tracks themselves need no cancellation — nothing is replayed.
+
+* 6. Minutes afterwards
+
+The live transcript is never revised (gufo returns no timestamps and no partial
+rewrites). The wav tracks are there so a second pass can do better:
+
+#+BEGIN_SRC sh
+./summarize.py meeting-<ts>.jsonl --model flash-next -o minutes.md
+#+END_SRC
+
+It chunks the transcript, condenses each part, then writes Summary / Decisions /
+Action items / Open questions from the LLM on :8080.
+
+* Tuning
+
+| symptom                       | change                                                     |
+|-------------------------------+------------------------------------------------------------+
+| clipped first syllables       | =--preroll 0.5=                                            |
+| one long rambling block       | =--min-silence 0.4=                                        |
+| sentence split mid-thought    | =--min-silence 1.2=, =--max-seg 20=                       |
+| noisy room, junk lines        | =--calibrate 3= (default 2), or =--threshold -38=          |
+| too many fragments            | =--min-speech 0.5=, =--hysteresis 8=                      |
+| want lower latency            | =--max-seg 6= — shorter chunks answer sooner               |
+| one server is not enough      | run a second =gufo serve asr= on :8082 and set =GUFO_ASR_URL_PEER= |
+
+Endpointing is an energy gate with hysteresis (=--threshold=, =--hysteresis=,
+=--min-silence=). It is not a neural VAD; on a noisy line swap
+=UtteranceSplitter= for =silero-vad= and leave the rest alone.
+
+* What will bite you
+
+- *=pw-record= into a pipe needs pipewire >= 1.2* (=-a= for headerless PCM); older
+  versions write a WAV header that cannot be fixed and the bytes are garbage.
+  The script prefers =parec= (raw by default), then =ffmpeg -f pulse=, then
+  =pw-record=. ffmpeg has no =-f pipewire= input at all — =-f pulse= is how you
+  reach pipewire-pulse. =pw-record --target= also wants a capture *node*, so a
+  plain sink monitor needs =parec=/=ffmpeg= or a =pw-loopback= virtual source.
+- *Utterance limits*: the server accepts 100 ms to 120 s per commit and caps one
+  WebSocket message at 4 MiB (about 60 s at 24 kHz mono). =--max-seg= is checked
+  against that at startup.
+- *If the model falls behind* the client drops audio instead of queueing it
+  (=--max-backlog=) and says so on a SYS line. With a 12 s cap and a 15x model
+  that should not happen; send one warm-up utterance after the model loads.
+- *Gufo has no authentication.* Keep the ASR server on 127.0.0.1.
+- *Raw pipes carry no clock*: bytes are the only timeline, so a stalled capture
+  silently shifts utterance times. That is why the =.md= stamps wall clock and
+  the wav tracks are the ground truth.
+- *Recording a call may need consent.* Check your jurisdiction and the
+  platform's policy before capturing the far end.
