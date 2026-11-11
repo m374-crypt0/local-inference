@@ -1,1 +1,4 @@
-models/
+models/*
+!models/.gitkeep
+logs/*
+!logs/.gitkeep
